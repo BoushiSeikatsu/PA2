@@ -1,81 +1,147 @@
-#include <cuda_runtime.h>
-#include <iostream>
+#include <cudaDefs.h>
+#include <time.h>
+#include <math.h>
+#include <random>
 
-constexpr unsigned int THREADS_PER_BLOCK_DIM = 8; // 8x8 threads in a block
+//WARNING!!! Do not change TPB and NO_FORCES for this demo !!!
+constexpr unsigned int TPB = 128;
+constexpr unsigned int NO_FORCES = 256;
+constexpr unsigned int NO_RAIN_DROPS = 1 << 20;
+
+constexpr unsigned int MEM_BLOCKS_PER_THREAD_BLOCK = 8;
 
 cudaError_t error = cudaSuccess;
+cudaDeviceProp deviceProp = cudaDeviceProp();
 
-__global__ void fillData(const unsigned int pitch, const unsigned int rows, const unsigned int cols, float* data)
+using namespace std;
+
+__host__ float3 *createData(const unsigned int length)
 {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-
-    // Check bounds to avoid out-of-bounds memory access
-    if (x < cols && y < rows)
-    {
-        // Calculate the offset to the correct element based on pitch
-        float* row = (float*)((char*)data + y * pitch);
-        row[x] = y * cols + x; // Fill data with incremental values
-    }
+	//TODO: Generate float3 vectors. You can use 'make_float3' method.
+	random_device rd;
+	mt19937_64 mt(rd());
+	uniform_real_distribution<float> dist(0.0f, 1.0f);
+	float3* data = static_cast<float*>(::new_handler(length * sizeof(float3)));
+	float3* ptr;
+	return data;
 }
 
-int main(int argc, char* argv[])
+__host__ void printData(const float3 *data, const unsigned int length)
 {
-    cudaDeviceProp deviceProp;
-    cudaGetDeviceProperties(&deviceProp, 0);
-    cudaSetDevice(0);
+	if (data == 0) return;
+	const float3 *ptr = data;
+	for (unsigned int i = 0; i<length; i++, ptr++)
+	{
+		printf("%5.2f %5.2f %5.2f ", ptr->x, ptr->y, ptr->z);
+	}
+}
 
-    float* devPtr;
-    float* hostPtr;
-    size_t pitch;
+////////////////////////////////////////////////////////////////////////////////////////////////////
+/// <summary>	Sums the forces to get the final one using parallel reduction. 
+/// 		    WARNING!!! The method was written to meet input requirements of our example, i.e. 128 threads and 256 forces  </summary>
+/// <param name="dForces">	  	The forces. </param>
+/// <param name="noForces">   	The number of forces. </param>
+/// <param name="dFinalForce">	[in,out] If non-null, the final force. </param>
+////////////////////////////////////////////////////////////////////////////////////////////////////
+__global__ void reduce(const float3 * __restrict__ dForces, const unsigned int noForces, float3* __restrict__ dFinalForce)
+{
+	__shared__ float3 sForces[TPB];					//SEE THE WARNING MESSAGE !!!
+	unsigned int tid = threadIdx.x;
+	unsigned int next = TPB;						//SEE THE WARNING MESSAGE !!!
 
-    const unsigned int mRows = 5;
-    const unsigned int mCols = 10;
+	float3* src = &sForces[tid];
+	*src = dForces[tid];
+	float3* src2 = (float3*)&dForces[tid + next];
+	src->x += src2->x;
+	src->y += src2->y;
+	src->z += src2->z;
+	__syncthreads();
+	next >>= 1;
+	if (tid >= next) return;
+	src2 = src + next;
+	src->x += src2->x;
+	src->y += src2->y;
+	src->z += src2->z;
+	__syncthreads();
+	next >>= 1;
+	if (tid >= next) return;
+	volatile float3* vscr = &sForces[tid];
+	volatile float3* vscr2 = vscr + next;
+	vscr->x += vscr2->x;
+	vscr->y += vscr2->y;
+	vscr->z += vscr2->z;
 
-    // Allocate pitch memory with alignment using cudaMallocPitch
-    cudaError_t err = cudaMallocPitch(&devPtr, &pitch, mCols * sizeof(float), mRows);
-    if (err != cudaSuccess)
-    {
-        std::cerr << "CUDA malloc failed!" << std::endl;
-        return -1;
-    }
+	//TODO: Make the reduction
+}
 
-    // Prepare grid and blocks (2D grid of 2D blocks of size 8x8)
-    dim3 threadsPerBlock(THREADS_PER_BLOCK_DIM, THREADS_PER_BLOCK_DIM);
-    dim3 numBlocks((mCols + THREADS_PER_BLOCK_DIM - 1) / THREADS_PER_BLOCK_DIM,
-        (mRows + THREADS_PER_BLOCK_DIM - 1) / THREADS_PER_BLOCK_DIM);
+////////////////////////////////////////////////////////////////////////////////////////////////////
+/// <summary>	Adds the FinalForce to every Rain drops position. </summary>
+/// <param name="dFinalForce">	The final force. </param>
+/// <param name="noRainDrops">	The number of rain drops. </param>
+/// <param name="dRainDrops"> 	[in,out] If non-null, the rain drops positions. </param>
+////////////////////////////////////////////////////////////////////////////////////////////////////
+__global__ void add(const float3* __restrict__ dFinalForce, const unsigned int noRainDrops, float3* __restrict__ dRainDrops)
+{
+	//TODO: Add the FinalForce to every Rain drops position.
+}
 
-    // Launch the kernel
-    fillData << <numBlocks, threadsPerBlock >> > (pitch, mRows, mCols, devPtr);
 
-    // Check for kernel launch errors
-    err = cudaGetLastError();
-    if (err != cudaSuccess)
-    {
-        std::cerr << "CUDA kernel launch failed: " << cudaGetErrorString(err) << std::endl;
-        return -1;
-    }
+int main(int argc, char *argv[])
+{
+	initializeCUDA(deviceProp);
 
-    // Allocate host memory for the matrix
-    hostPtr = (float*)malloc(mRows * mCols * sizeof(float));
+	cudaEvent_t startEvent, stopEvent;
+	float elapsedTime;
 
-    // Copy data back from device to host using cudaMemcpy2D
-    cudaMemcpy2D(hostPtr, mCols * sizeof(float), devPtr, pitch, mCols * sizeof(float), mRows, cudaMemcpyDeviceToHost);
+	cudaEventCreate(&startEvent);
+	cudaEventCreate(&stopEvent);
+	cudaEventRecord(startEvent, 0);
 
-    // Check the data by printing out the matrix
-    std::cout << "Matrix (after kernel incrementing):" << std::endl;
-    for (unsigned int i = 0; i < mRows; ++i)
-    {
-        for (unsigned int j = 0; j < mCols; ++j)
-        {
-            std::cout << hostPtr[i * mCols + j] << " ";
-        }
-        std::cout << std::endl;
-    }
+	float3 *hForces = createData(NO_FORCES);
+	float3 *hDrops = createData(NO_RAIN_DROPS);
 
-    // Free device and host memory
-    cudaFree(devPtr);
-    free(hostPtr);
+	float3 *dForces = nullptr;
+	float3 *dDrops = nullptr;
+	float3 *dFinalForce = nullptr;
 
-    return 0;
+	checkCudaErrors(cudaMalloc((void**)&dForces, NO_FORCES * sizeof(float3)));
+	checkCudaErrors(cudaMemcpy(dForces, hForces, NO_FORCES * sizeof(float3), cudaMemcpyHostToDevice));
+
+	checkCudaErrors(cudaMalloc((void**)&dDrops, NO_RAIN_DROPS * sizeof(float3)));
+	checkCudaErrors(cudaMemcpy(dDrops, hDrops, NO_RAIN_DROPS * sizeof(float3), cudaMemcpyHostToDevice));
+
+	checkCudaErrors(cudaMalloc((void**)&dFinalForce, sizeof(float3)));
+
+	KernelSetting ksReduce;
+
+	//TODO: ... Set ksReduce
+	
+	KernelSetting ksAdd;
+	//TODO: ... Set ksAdd
+	
+	for (unsigned int i = 0; i<1000; i++)
+	{
+		reduce<<<ksReduce.dimGrid, ksReduce.dimBlock>>>(dForces, NO_FORCES, dFinalForce);
+		add<<<ksAdd.dimGrid, ksAdd.dimBlock>>>(dFinalForce, NO_RAIN_DROPS, dDrops);
+	}
+
+	checkDeviceMatrix<float>((float*)dFinalForce, sizeof(float3), 1, 3, "%5.2f ", "Final force");
+	// checkDeviceMatrix<float>((float*)dDrops, sizeof(float3), NO_RAIN_DROPS, 3, "%5.2f ", "Final Rain Drops");
+
+	if (hForces)
+		free(hForces);
+	if (hDrops)
+		free(hDrops);
+
+	checkCudaErrors(cudaFree(dForces));
+	checkCudaErrors(cudaFree(dDrops));
+
+	cudaEventRecord(stopEvent, 0);
+	cudaEventSynchronize(stopEvent);
+
+	cudaEventElapsedTime(&elapsedTime, startEvent, stopEvent);
+	cudaEventDestroy(startEvent);
+	cudaEventDestroy(stopEvent);
+
+	printf("Time to get device properties: %f ms", elapsedTime);
 }
