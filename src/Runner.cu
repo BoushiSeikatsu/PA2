@@ -1,147 +1,181 @@
-#include <cudaDefs.h>
+﻿#include <cudaDefs.h>
 #include <time.h>
+#include <iostream>
+#include <cuda_runtime.h>
 #include <math.h>
 #include <random>
+using namespace std;
 
-//WARNING!!! Do not change TPB and NO_FORCES for this demo !!!
-constexpr unsigned int TPB = 128;
-constexpr unsigned int NO_FORCES = 256;
-constexpr unsigned int NO_RAIN_DROPS = 1 << 20;
 
-constexpr unsigned int MEM_BLOCKS_PER_THREAD_BLOCK = 8;
+
+using namespace std;
+const int patternLength = 16;
+__host__ float* createData(const unsigned int length)
+{
+	// Random number generator setup
+	std::random_device rd;
+	std::mt19937_64 mt(rd());
+	std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+
+	// Allocate memory for float array
+	float* data;
+	cudaMallocManaged(&data, length * sizeof(float));
+
+	if (!data) {
+		fprintf(stderr, "Memory allocation failed!\n");
+		return nullptr;
+	}
+
+	// Populate the array with random float values
+	for (unsigned int i = 0; i < length; i++) {
+		data[i] = dist(mt);
+	}
+
+	// Ensure memory is synchronized if using unified memory
+	cudaDeviceSynchronize();
+
+	return data;
+}
 
 cudaError_t error = cudaSuccess;
 cudaDeviceProp deviceProp = cudaDeviceProp();
 
-using namespace std;
-
-__host__ float3 *createData(const unsigned int length)
+#pragma region CustomStructure
+typedef struct __align__(8) CustomStructure
 {
-	//TODO: Generate float3 vectors. You can use 'make_float3' method.
-	random_device rd;
-	mt19937_64 mt(rd());
-	uniform_real_distribution<float> dist(0.0f, 1.0f);
-	float3* data = static_cast<float*>(::new_handler(length * sizeof(float3)));
-	float3* ptr;
-	return data;
+public:
+	int dim;				//dimension
+	int noRecords;			//number of Records
+
+	CustomStructure& operator=(const CustomStructure& other)
+	{
+		dim = other.dim;
+		noRecords = other.noRecords;
+		return *this;
+	}
+
+	inline void print()
+	{
+		printf("Dimension: %u\n", dim);
+		printf("Number of Records: %u\n", noRecords);
+	}
+}CustomStructure;
+#pragma endregion
+
+__constant__ __device__ int dScalarValue;
+__constant__ __device__ struct CustomStructure dCustomStructure;
+__constant__ __device__ int dConstantArray[20];
+__constant__ __device__ float dPattern[patternLength];
+
+__global__ void kernelConstantStruct(int *data, const unsigned int dataLength)
+{
+	unsigned int threadOffset = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (threadOffset < dataLength)
+		data[threadOffset] = dCustomStructure.dim;
 }
 
-__host__ void printData(const float3 *data, const unsigned int length)
+__global__ void kernelConstantArray(int *data, const unsigned int dataLength)
 {
-	if (data == 0) return;
-	const float3 *ptr = data;
-	for (unsigned int i = 0; i<length; i++, ptr++)
+	unsigned int threadOffset = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (threadOffset < dataLength)
+		data[threadOffset] = dConstantArray[0];
+}
+
+__global__ void kernelFindPattern(const float* __restrict__ reference, const size_t referenceLength, const size_t patternLength, bool* __restrict__ output)
+{
+	const unsigned int offset = threadIdx.x + blockIdx.x * blockDim.x;
+	//unsigned int blockOffset = (2e23 + 16 + 1)/
+	if (offset + patternLength <= referenceLength)
 	{
-		printf("%5.2f %5.2f %5.2f ", ptr->x, ptr->y, ptr->z);
+		bool isMatching = true;
+		for (int i = 0; i < patternLength; i++)
+		{
+			isMatching &= (dPattern[i] != reference[offset + i]); //Takhle se nam nerozbije warp (op na optimalizaci) 
+			//if (dPattern[i] != reference[offset + i])
+			//{
+				//isMatching = false;
+				//Kdybych tady dal break tak bych si rozbil warp, už ale ten warp rozbijím tím ifem, jde o to že nejedou najednou pararelně
+			//}
+		}
+		output[offset] = isMatching;
+	}
+	else
+	{
+		output[offset] = false;
 	}
 }
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-/// <summary>	Sums the forces to get the final one using parallel reduction. 
-/// 		    WARNING!!! The method was written to meet input requirements of our example, i.e. 128 threads and 256 forces  </summary>
-/// <param name="dForces">	  	The forces. </param>
-/// <param name="noForces">   	The number of forces. </param>
-/// <param name="dFinalForce">	[in,out] If non-null, the final force. </param>
-////////////////////////////////////////////////////////////////////////////////////////////////////
-__global__ void reduce(const float3 * __restrict__ dForces, const unsigned int noForces, float3* __restrict__ dFinalForce)
-{
-	__shared__ float3 sForces[TPB];					//SEE THE WARNING MESSAGE !!!
-	unsigned int tid = threadIdx.x;
-	unsigned int next = TPB;						//SEE THE WARNING MESSAGE !!!
-
-	float3* src = &sForces[tid];
-	*src = dForces[tid];
-	float3* src2 = (float3*)&dForces[tid + next];
-	src->x += src2->x;
-	src->y += src2->y;
-	src->z += src2->z;
-	__syncthreads();
-	next >>= 1;
-	if (tid >= next) return;
-	src2 = src + next;
-	src->x += src2->x;
-	src->y += src2->y;
-	src->z += src2->z;
-	__syncthreads();
-	next >>= 1;
-	if (tid >= next) return;
-	volatile float3* vscr = &sForces[tid];
-	volatile float3* vscr2 = vscr + next;
-	vscr->x += vscr2->x;
-	vscr->y += vscr2->y;
-	vscr->z += vscr2->z;
-
-	//TODO: Make the reduction
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-/// <summary>	Adds the FinalForce to every Rain drops position. </summary>
-/// <param name="dFinalForce">	The final force. </param>
-/// <param name="noRainDrops">	The number of rain drops. </param>
-/// <param name="dRainDrops"> 	[in,out] If non-null, the rain drops positions. </param>
-////////////////////////////////////////////////////////////////////////////////////////////////////
-__global__ void add(const float3* __restrict__ dFinalForce, const unsigned int noRainDrops, float3* __restrict__ dRainDrops)
-{
-	//TODO: Add the FinalForce to every Rain drops position.
-}
-
-
+//(l+m+1) / m -> l je velikost plochy co chci pokrýt, m je velikost kterou pokrýváme
 int main(int argc, char *argv[])
 {
 	initializeCUDA(deviceProp);
-
-	cudaEvent_t startEvent, stopEvent;
-	float elapsedTime;
-
-	cudaEventCreate(&startEvent);
-	cudaEventCreate(&stopEvent);
-	cudaEventRecord(startEvent, 0);
-
-	float3 *hForces = createData(NO_FORCES);
-	float3 *hDrops = createData(NO_RAIN_DROPS);
-
-	float3 *dForces = nullptr;
-	float3 *dDrops = nullptr;
-	float3 *dFinalForce = nullptr;
-
-	checkCudaErrors(cudaMalloc((void**)&dForces, NO_FORCES * sizeof(float3)));
-	checkCudaErrors(cudaMemcpy(dForces, hForces, NO_FORCES * sizeof(float3), cudaMemcpyHostToDevice));
-
-	checkCudaErrors(cudaMalloc((void**)&dDrops, NO_RAIN_DROPS * sizeof(float3)));
-	checkCudaErrors(cudaMemcpy(dDrops, hDrops, NO_RAIN_DROPS * sizeof(float3), cudaMemcpyHostToDevice));
-
-	checkCudaErrors(cudaMalloc((void**)&dFinalForce, sizeof(float3)));
-
-	KernelSetting ksReduce;
-
-	//TODO: ... Set ksReduce
-	
-	KernelSetting ksAdd;
-	//TODO: ... Set ksAdd
-	
-	for (unsigned int i = 0; i<1000; i++)
+	float* pattern = createData(16);
+	cudaMemcpyToSymbol(dPattern, pattern, sizeof(float)*patternLength);
+	float tmp[patternLength];
+	cudaMemcpyFromSymbol(tmp, dPattern, sizeof(float) * patternLength);
+	for(const auto& i : tmp)
 	{
-		reduce<<<ksReduce.dimGrid, ksReduce.dimBlock>>>(dForces, NO_FORCES, dFinalForce);
-		add<<<ksAdd.dimGrid, ksAdd.dimBlock>>>(dFinalForce, NO_RAIN_DROPS, dDrops);
+		std::cout << i << " ";
+	}
+	std::cout << std::endl;
+	const int referenceLength = 2e23;
+	float* dReference = nullptr;
+	cudaMalloc((void**)(&dReference), sizeof(float) * referenceLength);
+	float* hReference = createData(referenceLength);
+	const int threadNumber = 256;
+	const int numBlocks = (referenceLength + threadNumber + 1) / threadNumber;
+	bool* output = nullptr;
+	cudaMalloc((void**)(&dReference), sizeof(bool) * referenceLength);
+	kernelFindPattern << <numBlocks, threadNumber >> > (hReference, referenceLength, patternLength, output);
+	for (int i = 0; i < referenceLength; i++)
+	{
+		if (output[i])
+		{
+			cout << i << endl;
+			break;
+		}
 	}
 
-	checkDeviceMatrix<float>((float*)dFinalForce, sizeof(float3), 1, 3, "%5.2f ", "Final force");
-	// checkDeviceMatrix<float>((float*)dDrops, sizeof(float3), NO_RAIN_DROPS, 3, "%5.2f ", "Final Rain Drops");
+	/*
+	int scalarValue = 10;
+	cudaMemcpyToSymbol(dScalarValue, &scalarValue, sizeof(int));
+	int newValue;
+	cudaMemcpyFromSymbol(&newValue, dScalarValue, sizeof(int));
+	printf("Copied value: %d", newValue);
 
-	if (hForces)
-		free(hForces);
-	if (hDrops)
-		free(hDrops);
+	CustomStructure tmp = CustomStructure();
+	tmp.dim = 2;
+	tmp.noRecords = 5;
+	checkCudaErrors(cudaMemcpyToSymbol(dCustomStructure, &tmp,sizeof(tmp)));
+	CustomStructure result = CustomStructure();
+	checkCudaErrors(cudaMemcpyFromSymbol(&result, dCustomStructure, sizeof(dCustomStructure)));
+	result.print();
 
-	checkCudaErrors(cudaFree(dForces));
-	checkCudaErrors(cudaFree(dDrops));
+	int tmpArray[10] = {0,1,2,3,4,5,6,7,8,9};
+	cudaMemcpyToSymbol(dConstantArray, tmpArray, sizeof(int) * 10);
+	int resultArray[10] = {0};
+	cudaMemcpyFromSymbol(resultArray, dConstantArray, sizeof(int) * 10);
+	for (const auto& i : resultArray)
+	{
+		std::cout << i;
+	}
+	std::cout << std::endl;
+	//Test 0 - scalar Value
+	//Test 1 - structure
+	//Test2 - array*/
 
-	cudaEventRecord(stopEvent, 0);
-	cudaEventSynchronize(stopEvent);
-
-	cudaEventElapsedTime(&elapsedTime, startEvent, stopEvent);
-	cudaEventDestroy(startEvent);
-	cudaEventDestroy(stopEvent);
-
-	printf("Time to get device properties: %f ms", elapsedTime);
 }
+
+/*
+CREDIT TASK -> JE TŘEBA NASTAVIT LIMITY, POKUD CHCI VYUŽÍT CONSTANT PAMĚT, TAK BUDU MÍT MALÉ PAMĚTI MALÉ PROMĚNNÉ, POKUD VŠECKO BUDE V GLOBAL MEMORY TAK ZASE VELKÉ, JE TO JENOM O TOM SI TO OBHÁJIT. 
+ZÁLEŽÍ NA TOM JAK PRACUJEME S PAMĚTMI A JAK K NIM PŘISTUPUJEME
+POKUD BYCH BYL UPLNĚ CLUELESS TAK 19 SE DÁ ZKONZULTOVAT 
+
+INFO O PROJEKTECH JEŠTĚ
+SOLO NEBO DUO
+DO PŘIŠTĚ SI ROZMYSLET CO BUDU CHTÍT DĚLAT A JAK TO BUDU MÍT DATOVĚ ROZDĚLENÉ, UKÁZAT NA PAPÍŘE JAK TY DTAA V PAMĚTI BUDOU VYPADAT, ZKONZULTOVAT AŤ NEJDEME SLEPOU VĚTVÍ 
+CO BYCH CHTĚL DĚLAT? BUDU DĚLAT TO A TO, TAKOVOU MÁM PŘEDSTAVU O DATOVÉ SESTAVĚ, ON PAK DÁ FEEDBACK JESTLI TO JE STUPID NEBO NE
+
+CHCE TO KONZULTOVAT VŽDYCKY NA CVIKU, HODNĚ TO ULEHČÍ PROJEKT, PROTOŽE SE TO VYBRAINSTORMI NA CVIKU 
+*/
