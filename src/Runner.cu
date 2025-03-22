@@ -1,88 +1,138 @@
-// includes, cudaimageWidth
 #include <cudaDefs.h>
+#include <iostream>
+#include <cuda_runtime.h>
+#include <cmath>
+#include <vector>
 
-#include <helper_math.h>			// normalize method
+// Constants for discretization
+#define THRESHOLD 100 // Example threshold for discretization
+#define NUM_ELEMENTS 100 // Just an example for n (size of vector)
 
-#include <imageManager.h>
-#include <imageUtils.cuh>
-#include <benchmark.h>
+// CUDA kernel to discretize the matrix (converts to uint8_t)
+__global__ void discretize_matrix(float* M0, uint8_t* M1, int m, int n, float min_val, float max_val) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < m * n) {
+        // Normalize and discretize values to uint8_t
+        float value = M0[idx];
+        float normalized_value = (value - min_val) / (max_val - min_val); // Normalize to [0, 1]
+        M1[idx] = static_cast<uint8_t>(normalized_value * 255); // Discretize to uint8_t
+    }
+}
 
-#define TPB_1D 8						// ThreadsPerBlock in one dimension
-#define TPB_2D TPB_1D*TPB_1D			// ThreadsPerBlock = TPB_1D*TPB_1D (2D block)
+// CUDA kernel to compute Euclidean distance from the origin
+__global__ void compute_distance(uint8_t* M1, float* distances, int m, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < m) {
+        float dist = 0.0f;
+        for (int j = 0; j < n; j++) {
+            dist += powf(M1[idx * n + j], 2); // Sum of squares (Euclidean distance)
+        }
+        distances[idx] = sqrtf(dist); // Square root to get the distance
+    }
+}
+
+// CUDA kernel to find the farthest object (max distance)
+__global__ void find_farthest(float* distances, int* farthest_idx, int m) {
+    __shared__ float shared_distances[1024];
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < m) {
+        shared_distances[threadIdx.x] = distances[idx];
+        __syncthreads();
+
+        // Parallel reduction to find max distance
+        for (int stride = 1; stride < blockDim.x; stride *= 2) {
+            if (threadIdx.x % (2 * stride) == 0) {
+                shared_distances[threadIdx.x] = max(shared_distances[threadIdx.x], shared_distances[threadIdx.x + stride]);
+            }
+            __syncthreads();
+        }
+
+        if (threadIdx.x == 0) {
+            atomicMax(farthest_idx, shared_distances[0]);
+        }
+    }
+}
+
+// CUDA kernel to find the farthest element from the found object
+__global__ void find_farthest_element(uint8_t* M1, float* distances, int farthest_idx, int n, int* farthest_element_idx) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float max_dist = -1.0f;
+        int element_idx = -1;
+        for (int j = 0; j < n; j++) {
+            float dist = static_cast<float>(M1[farthest_idx * n + j]);
+            if (dist > max_dist) {
+                max_dist = dist;
+                element_idx = j;
+            }
+        }
+        *farthest_element_idx = element_idx;
+    }
+}
 
 cudaError_t error = cudaSuccess;
 cudaDeviceProp deviceProp = cudaDeviceProp();
 
-using namespace gpubenchmark;
-using DT = float;
+int main() {
+    initializeCUDA(deviceProp);
+    const int m = 2 << 20;  // m > 2^20
+    const int n = NUM_ELEMENTS; // Example n
 
+    // Initialize the matrix with random values (real numbers)
+    std::vector<float> M0(m * n);
+    for (int i = 0; i < m * n; i++) {
+        M0[i] = static_cast<float>(rand()) / static_cast<float>(RAND_MAX); // Random float between 0 and 1
+    }
 
-__host__ TextureInfo createTextureObjectFrom2DArray(const ImageInfo<DT>& ii)
-{
-	TextureInfo ti;
+    // Define min and max for normalization
+    float min_val = *std::min_element(M0.begin(), M0.end());
+    float max_val = *std::max_element(M0.begin(), M0.end());
 
-	// Size info
-	ti.size = { ii.width, ii.height, 1 };
-	//Texture Data settings
-	ti.texChannelDesc = cudaCreateChannelDesc<DT>();  // cudaCreateChannelDesc(32, 0, 0, 0, cudaChannelFormatKindUnsigned);
-	checkCudaErrors(cudaMallocArray(&ti.texArrayData, &ti.texChannelDesc, ii.width, ii.height));
-	checkCudaErrors(cudaMemcpyToArray(ti.texArrayData, 0,0, ii.dPtr, ii.pitch * ii.height, cudaMemcpyDeviceToDevice));
+    // Allocate memory for the discretized matrix and distances on the GPU
+    uint8_t* M1;
+    float* distances;
+    int* farthest_idx;
+    int* farthest_element_idx;
 
-	// Specify texture resource
-	ti.resDesc.resType = cudaResourceTypeArray;
-	ti.resDesc.res.array.array = ti.texArrayData;
+    cudaMalloc(&M1, m * n * sizeof(uint8_t));
+    cudaMalloc(&distances, m * sizeof(float));
+    cudaMalloc(&farthest_idx, sizeof(int));
+    cudaMalloc(&farthest_element_idx, sizeof(int));
 
-	// Specify texture object parameters
-	ti.texDesc.addressMode[0] = cudaAddressModeClamp;
-	ti.texDesc.addressMode[1] = cudaAddressModeClamp;
-	ti.texDesc.filterMode = cudaFilterModePoint;
-	ti.texDesc.readMode = cudaReadModeElementType;
-	ti.texDesc.normalizedCoords = false;
+    // Copy matrix M0 to device memory
+    cudaMemcpy(M1, M0.data(), m * n * sizeof(float), cudaMemcpyHostToDevice);
 
-	// Create texture object
-	checkCudaErrors(cudaCreateTextureObject(&ti.texObj, &ti.resDesc, &ti.texDesc, NULL));
+    // Call the discretize kernel
+    int block_size = 256;
+    int grid_size = (m * n + block_size - 1) / block_size;
+    discretize_matrix << <grid_size, block_size >> > (M0.data(), M1, m, n, min_val, max_val);
+    cudaDeviceSynchronize();
 
-	return ti;
-}
+    // Compute the distance from the origin
+    grid_size = (m + block_size - 1) / block_size;
+    compute_distance << <grid_size, block_size >> > (M1, distances, m, n);
+    cudaDeviceSynchronize();
 
-__global__ void texKernel(const cudaTextureObject_t srcTex, const unsigned int srcWidth, const unsigned int srcHeight, float* dst)
-{
-	int offset_x = threadIdx.x + blockIdx.x * blockDim.x;
-	int offset_y = threadIdx.y + blockIdx.y * blockDim.y;
-	if ((offset_x >= srcWidth) || (offset_y >= srcHeight)) return;
-	dst[srcWidth * offset_y + offset_x] = tex2D<float>(srcTex, offset_x, offset_y);
-}
+    // Find the farthest object
 
+    find_farthest << <grid_size, block_size >> > (distances, farthest_idx, m);
+    cudaDeviceSynchronize();
 
-int main(int argc, char *argv[])
-{
-	initializeCUDA(deviceProp);
-	FreeImage_Initialise();
+    // Find the farthest element from the farthest object
+    int farthest_idx_host;
+    cudaMemcpy(&farthest_idx_host, farthest_idx, sizeof(int), cudaMemcpyDeviceToHost);
+    find_farthest_element << <1, 1 >> > (M1, distances, *farthest_idx, n, farthest_element_idx);
+    cudaDeviceSynchronize();
 
-	// STEP 1 - load raw image data, HOST->DEVICE, with/without pitch
-	ImageInfo<DT> src;
-	prepareData<false>("C:\\Users\\dub0074\\Documents\\PA2\\src\\terrain10x10.tif", src);
+    int farthest_element_idx_host;
+    cudaMemcpy(&farthest_element_idx_host, farthest_element_idx, sizeof(int), cudaMemcpyDeviceToHost);
+    std::cout << "Farthest element index: " << farthest_element_idx_host << std::endl;
 
-	// STEP 2 - create texture from the raw data
-	TextureInfo tiSrc = createTextureObjectFrom2DArray(src);
+    // Cleanup
+    cudaFree(M1);
+    cudaFree(distances);
+    cudaFree(farthest_idx);
+    cudaFree(farthest_element_idx);
 
-	// STEP 3 - DO SOMETHING WITH THE TEXTURE
-	dim3 block = { TPB_1D, TPB_1D,1 };
-	dim3 grid{ (src.width + TPB_1D - 1) / TPB_1D, (src.height + TPB_1D - 1) / TPB_1D,  1 };
-	float* dst = nullptr;
-	cudaMalloc((void**)&dst, src.width * src.height * sizeof(float));
-	float gpuTime = GPUTIME(1, texKernel <<<grid, block>>> (tiSrc.texObj, src.width, src.height, dst));
-	printf("\x1B[93m[GPU time] %s: %f ms\033[0m\n", "getBest", gpuTime);
-	checkDeviceMatrix<float>(dst, src.width * sizeof(float), src.height, src.width, "%6.1f ", "dst");
-
-	// SETP 4 - release unused data
-	if (tiSrc.texObj) checkCudaErrors(cudaDestroyTextureObject(tiSrc.texObj));
-	if (tiSrc.texArrayData) checkCudaErrors(cudaFreeArray(tiSrc.texArrayData));
-	if (src.dPtr) cudaFree(src.dPtr);
-	if (dst) cudaFree(dst);
-
-	cudaDeviceSynchronize();
-	error = cudaGetLastError();
-
-	FreeImage_DeInitialise();
+    return 0;
 }
