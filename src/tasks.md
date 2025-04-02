@@ -1,9 +1,11 @@
 # Parallel Algorithms 2 - Practical Lessons
-## LESSON 6
+
+## LESSON 7
 ### Prerequisites
-* CUDA - unified memory (Unified Virtual Addressing)
-* Texture Object API
-* [Download an input image (3Kx3K terrain heightmap)](https://vsb.sharepoint.com/:i:/r/sites/PAII/Sdilene%20dokumenty/General/Practical%20Lessons/06/terrain3Kx3K.tif?csf=1&web=1&e=Mdll8x)
+* Texture reference API vs. Object API
+* OpenGL, freeglut, glew, textures, pixel buffer objects
+* CUDA - OpenGL interoperability
+* [Download a test image](https://vsb.sharepoint.com/:u:/r/sites/PAII/Sdilene%20dokumenty/General/Practical%20Lessons/07/data7.zip?csf=1&web=1&e=tEkFBo)
 ### Topics and Tasks
-Load the heightmap and prepare a texture using CUDA Texture Object API
-Create a normal map from the input image using a Sobel operator
+* Follow the instructions from the seminar.
+* Then try to solve these tasks written in the **Runner.cu** file

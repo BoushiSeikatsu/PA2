@@ -1,151 +1,285 @@
-// includes, cudaimageWidth
+#include <glew.h>
+#include <freeglut.h>
+
 #include <cudaDefs.h>
 
-#include <helper_math.h>			// normalize method
+#include <cuda_gl_interop.h>
+#include <helper_cuda.h>							// normalize method
+#include <helper_math.h>							// normalize method
 
 #include <imageManager.h>
-#include <imageUtils.cuh>
 #include <benchmark.h>
 
-
-#define TPB_1D 8						// ThreadsPerBlock in one dimension
-#define TPB_2D TPB_1D*TPB_1D			// ThreadsPerBlock = TPB_1D*TPB_1D (2D block)
+#define TPB_1D 8									// ThreadsPerBlock in one dimension
+#define TPB_2D TPB_1D*TPB_1D						// ThreadsPerBlock = TPB_1D*TPB_1D (2D block)
 
 cudaError_t error = cudaSuccess;
 cudaDeviceProp deviceProp = cudaDeviceProp();
-__constant__ int dfilter_x[3][3];
-__constant__ int dfilter_y[3][3];
-using DT = float;
 
-__host__ TextureInfo createTextureObjectFrom2DArray(const ImageInfo<DT>& ii)
+using DT = uchar4;
+
+//OpenGL
+struct GLData
 {
-	TextureInfo ti;
+	unsigned int imageWidth;
+	unsigned int imageHeight;
+	unsigned int imageBPP;							//Bits Per Pixel = 8, 16, 24, or 32 bit
+	unsigned int imagePitch;
 
-	// Size info
-	ti.size = { ii.width, ii.height, 1 };
-	//Texture Data settings
-	ti.texChannelDesc = cudaCreateChannelDesc<DT>();  // cudaCreateChannelDesc(32, 0, 0, 0, cudaChannelFormatKindUnsigned);
-	checkCudaErrors(cudaMallocArray(&ti.texArrayData, &ti.texChannelDesc, ii.width, ii.height));
-	checkCudaErrors(cudaMemcpyToArray(ti.texArrayData, 0, 0, ii.dPtr, ii.pitch * ii.height, cudaMemcpyDeviceToDevice));
+	unsigned int pboID;
+	unsigned int textureID;
+	unsigned int viewportWidth = 1024;
+	unsigned int viewportHeight = 1024;
+};
+GLData gl;
 
-	// Specify texture resource
-	ti.resDesc.resType = cudaResourceTypeArray;
-	ti.resDesc.res.array.array = ti.texArrayData;
+unsigned char someValue = 0;
 
-	// Specify texture object parameters
-	ti.texDesc.addressMode[0] = cudaAddressModeClamp;
-	ti.texDesc.addressMode[1] = cudaAddressModeClamp;
-	ti.texDesc.filterMode = cudaFilterModePoint;
-	ti.texDesc.readMode = cudaReadModeElementType;
-	ti.texDesc.normalizedCoords = false;
+//CUDA
+struct CudaData
+{
+	cudaTextureDesc			texDesc;				// Texture descriptor used to describe texture parameters
 
-	// Create texture object
-	checkCudaErrors(cudaCreateTextureObject(&ti.texObj, &ti.resDesc, &ti.texDesc, NULL));
+	cudaArray_t				texArrayData;			// Source texture data
+	cudaResourceDesc		resDesc;				// A resource descriptor for obtaining the texture data
+	cudaChannelFormatDesc	texChannelDesc;			// Texture channel descriptor to define channel bytes
+	cudaTextureObject_t		texObj;					// Cuda Texture Object to be produces
 
-	return ti;
+	cudaGraphicsResource_t  texResource;
+	cudaGraphicsResource_t	pboResource;
 
+	CudaData()
+	{
+		memset(this, 0, sizeof(CudaData));			// DO NOT DELETE THIS !!!
+	}
+};
+
+CudaData cd;
+
+
+#pragma region CUDA Routines
+
+__global__ void applyFilter(const cudaTextureObject_t srcTex, const unsigned char someValue, const unsigned int pboWidth, const unsigned int pboHeight, unsigned char* pbo)
+{
+	unsigned int offset_x = blockIdx.x * blockDim.x + threadIdx.x;
+	unsigned int offset_y = blockIdx.y * blockDim.y + threadIdx.y;
+	if (offset_x >= pboWidth || offset_y >= pboHeight)
+		return;
+	uint32_t pboElementOffset = (offset_y * pboWidth + offset_x) * 4;
+	DT d = tex2D<DT>(srcTex, offset_x, offset_y);
+	d.x += someValue;
+	pbo[pboElementOffset++] = someValue;
+	pbo[pboElementOffset++] = d.y;
+	pbo[pboElementOffset++] = d.z;
+	pbo[pboElementOffset++] = d.w;
 }
 
-template<bool normalizeTexel>__global__ void createNormalmap(const cudaTextureObject_t srcTex, const unsigned int srcWidth, const unsigned int srcHeight, const unsigned int dstPitchInElements, uchar3* dst)
+void cudaWorker()
 {
-	//TODO
-	const unsigned int offset_x = threadIdx.x + blockIdx.x * blockDim.x;
-	const unsigned int offset_y = threadIdx.y + blockIdx.y * blockDim.y;
-    unsigned int position = offset_y * dstPitchInElements + offset_x;
-	int sum_x = 0;
-	int sum_y = 0;
-	if ((offset_x >= srcWidth) || (offset_y >= srcHeight)) return;
-	if (offset_y - 1 > 0)
-	{
-		if (offset_x - 1 > 0)
-		{
-			sum_x += tex2D<float>(srcTex, offset_x - 1, offset_y - 1) * dfilter_x[0][0];
-			sum_y += tex2D<float>(srcTex, offset_x - 1, offset_y - 1) * dfilter_y[0][0];
+	// TODO: Map GL resources (TEXTURE and PBO)
+	cudaGraphicsMapResources(1, &cd.texResource, 0);
+	cudaGraphicsSubResourceGetMappedArray(&cd.texArrayData, cd.texResource, 0, 0);
+	unsigned char* pboData;
+	size_t pbo_size = 0;
+	cudaGraphicsMapResources(1, &cd.pboResource, 0);
+	cudaGraphicsResourceGetMappedPointer((void**)&pboData, &pbo_size, cd.pboResource);
 
-		}
-		sum_x += tex2D<float>(srcTex, offset_x, offset_y - 1) * dfilter_x[0][1];
-		sum_y += tex2D<float>(srcTex, offset_x, offset_y - 1) * dfilter_y[0][1];
-		sum_x += tex2D<float>(srcTex, offset_x + 1, offset_y - 1) * dfilter_x[0][2];
-		sum_y += tex2D<float>(srcTex, offset_x + 1, offset_y - 1) * dfilter_y[0][2];
-	}
-	if (offset_x - 1 > 0)
-	{
-		sum_x += tex2D<float>(srcTex, offset_x - 1, offset_y) * dfilter_x[1][0];
-		sum_y += tex2D<float>(srcTex, offset_x - 1, offset_y) * dfilter_y[1][0];
-		sum_x += tex2D<float>(srcTex, offset_x - 1, offset_y + 1) * dfilter_x[2][0];
-		sum_y += tex2D<float>(srcTex, offset_x - 1, offset_y + 1) * dfilter_y[2][0];
-	}
-	sum_x += tex2D<float>(srcTex, offset_x, offset_y + 1) * dfilter_x[2][1];
-	sum_y += tex2D<float>(srcTex, offset_x, offset_y + 1) * dfilter_y[2][1];
-	sum_x += tex2D<float>(srcTex, offset_x + 1, offset_y) * dfilter_x[1][2];
-	sum_y += tex2D<float>(srcTex, offset_x + 1, offset_y) * dfilter_y[1][2];
-	sum_x += tex2D<float>(srcTex, offset_x + 1, offset_y + 1) * dfilter_x[2][2];
-	sum_y += tex2D<float>(srcTex, offset_x + 1, offset_y + 1) * dfilter_y[2][2];
-	float3 d;
-	d.x = sum_x;
-	d.y = sum_y;
-	d.z = 1.f/2.f;
-	if (normalizeTexel)
-	{
-		d = normalize(d);
-	}
-	d.x = (d.x + 1) * 127.5;
-	d.y = (d.y + 1) * 127.5;
-	d.z = (d.z + 1) * 127.5;
-	dst[position] = make_uchar3(static_cast<uint8_t>(d.z), static_cast<uint8_t>(d.y), static_cast<uint8_t>(d.x));
+	// TODO: Run kernel
+	someValue++;
+	if (someValue > 255)
+		someValue = 0;
+	dim3 block(TPB_1D, TPB_1D);
+	dim3 grid((gl.imageWidth + block.x - 1) / block.x, (gl.imageHeight + block.y - 1) / block.y);
+	applyFilter << <grid, block >> > (cd.texObj, someValue, gl.imageWidth, gl.imageHeight, pboData);
+
+
+	// TODO: Unmap GL Resources (TEXTURE + PBO)
+	cudaGraphicsUnmapResources(1, &cd.pboResource, 0);
+	cudaGraphicsUnmapResources(1, &cd.texResource, 0);
+
+	
+	// This updates GL texture from PBO
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, gl.pboID);
+	glBindTexture(GL_TEXTURE_2D, gl.textureID);
+	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, gl.imageWidth, gl.imageHeight, GL_RGBA, GL_UNSIGNED_BYTE, NULL);   //Source parameter is NULL, Data is coming from a PBO, not host memory
+
+	printf(".");
 }
 
-void saveTexImage(const char* imageFileName, const uint32_t dstWidth, const uint32_t dstHeight, const uint32_t dstPitch, const uchar3* dstData)
+void initCUDAObjects()
 {
-	FIBITMAP* tmp = FreeImage_Allocate(dstWidth, dstHeight, 24);
-	unsigned int tmpPitch = FreeImage_GetPitch(tmp);					// FREEIMAGE align row data ... You have to use pitch instead of width
-	checkCudaErrors(cudaMemcpy2D(FreeImage_GetBits(tmp), tmpPitch, dstData, dstPitch, dstWidth * 3, dstHeight, cudaMemcpyDeviceToHost));
-	//FreeImage_Save(FIF_BMP, tmp, imageFileName, 0);
-	ImageManager::GenericWriter(tmp, imageFileName, FIF_BMP);
+	// TODO: Register Image to cuda tex resource
+	checkCudaErrors(cudaGraphicsGLRegisterImage(&cd.texResource,gl.textureID,GL_TEXTURE_2D,cudaGraphicsRegisterFlagsReadOnly));
+
+	// TODO: Map reousrce and retrieve pointer to undelying array data
+	checkCudaErrors(cudaGraphicsMapResources(1, &cd.texResource, 0));
+	checkCudaErrors(cudaGraphicsSubResourceGetMappedArray(&cd.texArrayData, cd.texResource, 0, 0));
+
+	// TODO: Set resource descriptor
+	cd.resDesc.resType = cudaResourceTypeArray;
+	cd.resDesc.res.array.array = cd.texArrayData;
+
+	// TODO: Set Texture Descriptor: Tex Units will know how to read the texture
+	// Set the readMode, normalizedCoords, filterMode, addressMode for each dimension
+	cd.texDesc.addressMode[0] = cudaAddressModeClamp;
+	cd.texDesc.addressMode[1] = cudaAddressModeClamp;
+	cd.texDesc.filterMode = cudaFilterModePoint;
+	cd.texDesc.readMode = cudaReadModeElementType;
+	cd.texDesc.normalizedCoords = false;
+
+	// TODO: Set Channel Descriptor: How to interpret individual bytes. Retrieve the data from cd.texArrayData
+	checkCudaErrors(cudaGetChannelDesc(&cd.texChannelDesc, cd.texArrayData));
+
+	// TODO: Create CUDA Texture Object
+	checkCudaErrors(cudaCreateTextureObject(&cd.texObj, &cd.resDesc, &cd.texDesc, NULL));
+
+	// TODO: Unmap resource: Release the resource for OpenGL
+	checkCudaErrors(cudaGraphicsUnmapResources(1, &cd.texResource, 0));
+
+	// TODO: Register PBO
+	checkCudaErrors(cudaGraphicsGLRegisterBuffer(&cd.pboResource, gl.pboID, cudaGraphicsMapFlagsWriteDiscard));
+}
+
+void releaseCUDA()
+{
+	cudaGraphicsUnregisterResource(cd.pboResource);
+	cudaGraphicsUnregisterResource(cd.texResource);
+}
+#pragma endregion
+
+#pragma region OpenGL Routines
+void prepareGlObjects(const char* imageFileName)
+{
+	FIBITMAP* tmp = ImageManager::GenericLoader(imageFileName, 0);
+	gl.imageWidth = FreeImage_GetWidth(tmp);
+	gl.imageHeight = FreeImage_GetHeight(tmp);
+	gl.imageBPP = FreeImage_GetBPP(tmp);
+	gl.imagePitch = FreeImage_GetPitch(tmp);
+
+	//OpenGL Texture
+	glEnable(GL_TEXTURE_2D);
+	glGenTextures(1, &gl.textureID);
+	glBindTexture(GL_TEXTURE_2D, gl.textureID);
+
+	//WARNING: Just some of inner format are supported by CUDA!!!
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, gl.imageWidth, gl.imageHeight, 0, GL_BGRA, GL_UNSIGNED_BYTE, FreeImage_GetBits(tmp));
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
+
 	FreeImage_Unload(tmp);
+
+	glGenBuffers(1, &gl.pboID);
+	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, gl.pboID);														// Make this the current UNPACK buffer (OpenGL is state-based)
+	glBufferData(GL_PIXEL_UNPACK_BUFFER, gl.imageWidth * gl.imageHeight * 4, NULL, GL_DYNAMIC_COPY);	// Allocate data for the buffer. 4-channel 8-bit image
 }
 
-__global__ void texKernel(const cudaTextureObject_t srcTex, const unsigned int srcWidth, const unsigned int srcHeight, float* dst)
+void my_display()
 {
-	int offset_x = threadIdx.x + blockIdx.x * blockDim.x;
-	int offset_y = threadIdx.y + blockIdx.y * blockDim.y;
-	if ((offset_x >= srcWidth) || (offset_y >= srcHeight)) return;
-	dst[srcWidth * offset_y + offset_x] = tex2D<float>(srcTex, offset_x, offset_y);
+	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+	glEnable(GL_TEXTURE_2D);
+	glBindTexture(GL_TEXTURE_2D, gl.textureID);
+
+	glBegin(GL_QUADS);
+
+	glTexCoord2d(0, 0);		glVertex2d(0, 0);
+	glTexCoord2d(1, 0);		glVertex2d(gl.viewportWidth, 0);
+	glTexCoord2d(1, 1);		glVertex2d(gl.viewportWidth, gl.viewportHeight);
+	glTexCoord2d(0, 1);		glVertex2d(0, gl.viewportHeight);
+
+	glEnd();
+
+	glDisable(GL_TEXTURE_2D);
+
+	glFlush();
+	glutSwapBuffers();
 }
 
+void my_resize(GLsizei w, GLsizei h)
+{
+	gl.viewportWidth = w;
+	gl.viewportHeight = h;
 
-int main(int argc, char *argv[])
+	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+	glViewport(0, 0, gl.viewportWidth, gl.viewportHeight);
+
+	glMatrixMode(GL_PROJECTION);
+	glLoadIdentity();
+	gluOrtho2D(0, gl.viewportWidth, 0, gl.viewportHeight);
+
+	glMatrixMode(GL_MODELVIEW);
+	glLoadIdentity();
+	glutPostRedisplay();
+}
+
+void my_idle()
+{
+	cudaWorker();
+	glutPostRedisplay();
+}
+
+void initGL(int argc, char** argv)
+{
+	glutInit(&argc, argv);
+
+	glutInitDisplayMode(GLUT_RGBA | GLUT_DEPTH | GLUT_DOUBLE);
+	glutInitWindowSize(gl.viewportWidth, gl.viewportHeight);
+	glutInitWindowPosition(0, 0);
+	glutSetOption(GLUT_RENDERING_CONTEXT, false ? GLUT_USE_CURRENT_CONTEXT : GLUT_CREATE_NEW_CONTEXT);
+	glutCreateWindow(0);
+
+	char m_windowsTitle[512];
+	sprintf_s(m_windowsTitle, 512, "SimpleView | context %s | renderer %s | vendor %s ",
+		(const char*)glGetString(GL_VERSION),
+		(const char*)glGetString(GL_RENDERER),
+		(const char*)glGetString(GL_VENDOR));
+	glutSetWindowTitle(m_windowsTitle);
+
+	glutDisplayFunc(my_display);
+	glutReshapeFunc(my_resize);
+	glutIdleFunc(my_idle);
+	glutSetCursor(GLUT_CURSOR_CROSSHAIR);
+
+	// initialize necessary OpenGL extensions
+	glewInit();
+
+	glClearColor(0.0, 0.0, 0.0, 1.0);
+	glShadeModel(GL_SMOOTH);
+	glViewport(0, 0, gl.viewportWidth, gl.viewportHeight);
+
+	glFlush();
+}
+
+void releaseOpenGL()
+{
+	if (gl.textureID > 0)
+		glDeleteTextures(1, &gl.textureID);
+	if (gl.pboID > 0)
+		glDeleteBuffers(1, &gl.pboID);
+}
+#pragma endregion OpenGL Routines
+
+void releaseResources()
+{
+	releaseCUDA();
+	releaseOpenGL();
+}
+
+int main(int argc, char* argv[])
 {
 	initializeCUDA(deviceProp);
 	FreeImage_Initialise();
-	int filter_x[3][3] = { { -1, 0, 1 },{ -2, 0, 2 },{ -1, 0, 1 } };
-	int filter_y[3][3] = { { -1, -2, -1 },{ 0, 0, 0 },{ 1, 2, 1 } };
-	cudaMemcpyToSymbol(dfilter_x, filter_x, 3 * 3 * sizeof(int));
-	cudaMemcpyToSymbol(dfilter_y, filter_y, 3 * 3 * sizeof(int));
-	// STEP 1 - load raw image data, HOST->DEVICE, with/without pitch
-	ImageInfo<DT> src;
-	prepareData<false>("C:\\Users\\dub0074\\Documents\\PA2\\src/terrain3Kx3K.tif", src);
 
-	// STEP 2 - create texture from the raw data
-	TextureInfo tiSrc = createTextureObjectFrom2DArray(src);
-	// SETP 3 - allocate pitch memory to store output image data
-	
-	size_t dstPitch;
-	uchar3* dst = 0;
-	cudaMallocPitch((void**)&dst, &dstPitch, src.width * sizeof(uchar3), src.height);
-	// STEP 4 - create normal map
-	dim3 block = { TPB_1D, TPB_1D,1 };
-	dim3 grid{ (src.width + TPB_1D - 1) / TPB_1D, (src.height + TPB_1D - 1) / TPB_1D,  1 };
-	createNormalmap<true> << <grid, block >> > (tiSrc.texObj, src.width, src.height, dstPitch / sizeof(uchar3), dst);
-	// STEP 5 - save the normal map
-	saveTexImage("C:\\Users\\dub0074\\Documents\\PA2\\src/normalmap.bmp", src.width, src.height, dstPitch, dst);
-	// SETP 6 - release unused data
-	if (tiSrc.texObj) checkCudaErrors(cudaDestroyTextureObject(tiSrc.texObj));
-	if (tiSrc.texArrayData) checkCudaErrors(cudaFreeArray(tiSrc.texArrayData));
-	//if (src.) cudaFree(src.dPtr);
-	if (dst) cudaFree(dst);
-	cudaDeviceSynchronize();
-	error = cudaGetLastError();
+	initGL(argc, argv);
+	prepareGlObjects("C:\\Users\\dub0074\\Documents\\PA2\\src/lena.png");
 
+	initCUDAObjects();
+
+	//start rendering mainloop
+	glutMainLoop();
 	FreeImage_DeInitialise();
+	atexit(releaseResources);
 }
