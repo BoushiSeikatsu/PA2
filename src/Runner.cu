@@ -1,643 +1,301 @@
-#include <glew.h>
-#include <freeglut.h>
-#include <FreeImage.h> // Added for explicitness
-
 #include <cudaDefs.h>
-
-#include <cuda_gl_interop.h>
-#include <helper_cuda.h>
-#include <helper_math.h>
-
-#include <imageManager.h> // Assumes this includes FreeImage.h implicitly or handles its init/deinit
+#include <time.h>
+#include <math.h>
 #include <benchmark.h>
-
-#define TPB_1D 8									// ThreadsPerBlock in one dimension
-#define TPB_2D TPB_1D*TPB_1D						// ThreadsPerBlock = TPB_1D*TPB_1D (2D block)
 
 cudaError_t error = cudaSuccess;
 cudaDeviceProp deviceProp = cudaDeviceProp();
 
-bool simulationRunning = true;
-int* d_stopFlag = nullptr; // Device pointer for the global stop flag
+constexpr unsigned int N = 1 << 22;
+constexpr unsigned int MEMSIZE = N * sizeof(unsigned int);
+constexpr unsigned int NO_LOOPS = 100;
+constexpr unsigned int TPB = 256;
+constexpr unsigned int GRID_SIZE = (N + TPB - 1) / TPB;
 
-using DT = uchar4; // Data type for pixels
+constexpr unsigned int NO_TEST_PHASES = 10;
 
-__constant__ uchar4 d_COLOR_BLACK;
-__constant__ uchar4 d_COLOR_GREEN;
-__constant__ uchar4 d_COLOR_RED;
-__constant__ uchar4 d_COLOR_WHITE;
-
-
-//OpenGL Data
-struct GLData
+void fillData(unsigned int *data, const unsigned int length)
 {
-	unsigned int imageWidth;
-	unsigned int imageHeight;
-	unsigned int imageBPP;
-	unsigned int imagePitch;
-
-	unsigned int pboID;
-	unsigned int textureID;
-	unsigned int viewportWidth = 1024;
-	unsigned int viewportHeight = 1024;
-};
-GLData gl;
-
-
-//CUDA Data (including interop resources)
-struct CudaData
-{
-	cudaTextureDesc			texDesc;
-	cudaArray_t				texArrayData;
-	cudaResourceDesc		resDesc;
-	cudaChannelFormatDesc	texChannelDesc;
-	cudaTextureObject_t		texObj;
-
-	cudaGraphicsResource_t  texResource; // Interop for GL Texture
-	cudaGraphicsResource_t	pboResource; // Interop for GL PBO
-
-	CudaData()
+	for (unsigned int i=0; i<length; i++)
 	{
-		memset(this, 0, sizeof(CudaData)); // DO NOT DELETE THIS !!!
+		data[i]= 1;
 	}
-};
-CudaData cd;
-
-
-#pragma region CUDA Routines
-
-// Helper function to compare uchar4 colors (ignoring alpha)
-__device__ inline bool colorsMatch(const uchar4 c1, const uchar4 c2) {
-	return c1.x == c2.x && c1.y == c2.y && c1.z == c2.z;
 }
 
-// CUDA Kernel for disease spread simulation
-__global__ void diseaseSpreadKernel(const cudaTextureObject_t srcTex, const unsigned int pboWidth, const unsigned int pboHeight, DT* pbo, int* stopFlag)
+void printData(const unsigned int *data, const unsigned int length)
 {
-	unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
-	unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
-
-	if (x >= pboWidth || y >= pboHeight)
-		return;
-
-	DT previousPixelState = tex2D<DT>(srcTex, x, y);
-	DT nextPixelState = previousPixelState; // Default: pixel stays the same
-
-	// --- Spreading Logic: Black becomes Red if any of 8 neighbors were Red ---
-	if (colorsMatch(previousPixelState, d_COLOR_BLACK))
+	if (data ==0) return;
+	for (unsigned int i=0; i<length; i++)
 	{
-		DT nN = tex2D<DT>(srcTex, x, y + 1);
-		DT nS = tex2D<DT>(srcTex, x, y - 1);
-		DT nE = tex2D<DT>(srcTex, x + 1, y);
-		DT nW = tex2D<DT>(srcTex, x - 1, y);
-		DT nNW = tex2D<DT>(srcTex, x - 1, y + 1);
-		DT nNE = tex2D<DT>(srcTex, x + 1, y + 1);
-		DT nSW = tex2D<DT>(srcTex, x - 1, y - 1);
-		DT nSE = tex2D<DT>(srcTex, x + 1, y - 1);
-
-		if (colorsMatch(nN, d_COLOR_RED) || colorsMatch(nS, d_COLOR_RED) ||
-			colorsMatch(nE, d_COLOR_RED) || colorsMatch(nW, d_COLOR_RED) ||
-			colorsMatch(nNW, d_COLOR_RED) || colorsMatch(nNE, d_COLOR_RED) ||
-			colorsMatch(nSW, d_COLOR_RED) || colorsMatch(nSE, d_COLOR_RED))
-		{
-			nextPixelState = d_COLOR_RED;
-		}
+		printf("%u ", data[i]);
 	}
+}
 
-	// --- Stopping Condition Check: Stop if Red is next to Green OR next to Barrier next to Green ---
-	bool nextStateIsRed = colorsMatch(nextPixelState, d_COLOR_RED);
-	bool shouldStop = false; // Local flag for this thread
 
-	if (nextStateIsRed)
+__global__ void kernel(const unsigned int *a, const unsigned int *b, const unsigned int length, unsigned int *c)
+{
+	const unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	//TODO:  thread block loop
+	if (tid < length)
 	{
-		// Read immediate 8 neighbors (previous state)
-		DT nN = tex2D<DT>(srcTex, x, y + 1);
-		DT nS = tex2D<DT>(srcTex, x, y - 1);
-		DT nE = tex2D<DT>(srcTex, x + 1, y);
-		DT nW = tex2D<DT>(srcTex, x - 1, y);
-		DT nNW = tex2D<DT>(srcTex, x - 1, y + 1);
-		DT nNE = tex2D<DT>(srcTex, x + 1, y + 1);
-		DT nSW = tex2D<DT>(srcTex, x - 1, y - 1);
-		DT nSE = tex2D<DT>(srcTex, x + 1, y - 1);
+		c[tid] = a[tid] + b[tid];
+	}
+}
 
-		// Check Level 1: Direct Red -> Green contact
-		if (colorsMatch(nN, d_COLOR_GREEN) || colorsMatch(nS, d_COLOR_GREEN) ||
-			colorsMatch(nE, d_COLOR_GREEN) || colorsMatch(nW, d_COLOR_GREEN) ||
-			colorsMatch(nNW, d_COLOR_GREEN) || colorsMatch(nNE, d_COLOR_GREEN) ||
-			colorsMatch(nSW, d_COLOR_GREEN) || colorsMatch(nSE, d_COLOR_GREEN))
+////////////////////////////////////////////////////////////////////////////////////////////////////
+/// <summary>	Tests 1. - single stream, async calling </summary>
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void test1()
+{
+	unsigned int *a, *b, *c;
+	unsigned int *da, *db, *dc;
+
+	// paged-locked allocation
+	cudaHostAlloc((void**)&a, NO_LOOPS * MEMSIZE,cudaHostAllocDefault);
+	cudaHostAlloc((void**)&b, NO_LOOPS * MEMSIZE,cudaHostAllocDefault);
+	cudaHostAlloc((void**)&c, NO_LOOPS * MEMSIZE,cudaHostAllocDefault);
+
+	fillData(a, NO_LOOPS * N);
+	fillData(b, NO_LOOPS * N);
+
+	// Data chunks on GPU
+	cudaMalloc( (void**)&da, MEMSIZE );
+	cudaMalloc( (void**)&db, MEMSIZE );
+	cudaMalloc( (void**)&dc, MEMSIZE );
+
+	//TODO: create stream
+
+	cudaStream_t stream;
+	//cudaStream_t stream2;
+	cudaStreamCreate(&stream);
+	//cudaStreamCreate(&stream2);
+	
+	auto lambda = [&]()
+	{	
+		unsigned int dataOffset = 0;
+		for (int i = 0; i < NO_LOOPS; i++)
 		{
-			shouldStop = true;
+			cudaMemcpyAsync(da, &a[dataOffset], MEMSIZE, cudaMemcpyHostToDevice, stream);
+			cudaMemcpyAsync(db, &b[dataOffset], MEMSIZE, cudaMemcpyHostToDevice, stream);
+			kernel << <GRID_SIZE, TPB >> > (da, db, N, dc);
+			cudaMemcpyAsync(&c[dataOffset], dc, MEMSIZE, cudaMemcpyDeviceToHost, stream);
+			dataOffset += N;
+			//TODO:  copy a->da, b->db
+			//TODO:  run the kernel in the stream
+			//TODO:  copy dc->c
+
 		}
-		else
+	};
+	float gpuTime = GPUTIME(NO_TEST_PHASES, lambda());
+
+	cudaStreamSynchronize(stream); // wait for stream to finish
+	cudaStreamDestroy(stream);
+	cudaDeviceSynchronize();
+	printf("\x1B[93m[GPU time] %s: %f ms\033[0m\n", __PRETTY_FUNCTION__, gpuTime);
+
+	//printData(c, 100);
+	
+	cudaFree(da);
+	cudaFree(db);
+	cudaFree(dc);
+
+	cudaFreeHost(a);
+	cudaFreeHost(b);
+	cudaFreeHost(c);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+/// <summary>	Tests 2. - two streams - depth first approach </summary>
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void test2()
+{
+	unsigned int* a, * b, * c;
+	unsigned int* da, * db, * dc;
+	unsigned int* a2, * b2, * c2;
+	unsigned int* da2, * db2, * dc2;
+	// paged-locked allocation
+	cudaHostAlloc((void**)&a, NO_LOOPS * MEMSIZE, cudaHostAllocDefault);
+	cudaHostAlloc((void**)&b, NO_LOOPS * MEMSIZE, cudaHostAllocDefault);
+	cudaHostAlloc((void**)&c, NO_LOOPS * MEMSIZE, cudaHostAllocDefault);
+
+	fillData(a, NO_LOOPS * N);
+	fillData(b, NO_LOOPS * N);
+
+	// Data chunks on GPU
+	cudaMalloc((void**)&da, MEMSIZE);
+	cudaMalloc((void**)&db, MEMSIZE);
+	cudaMalloc((void**)&dc, MEMSIZE);
+
+	cudaHostAlloc((void**)&a2, NO_LOOPS * MEMSIZE, cudaHostAllocDefault);
+	cudaHostAlloc((void**)&b2, NO_LOOPS * MEMSIZE, cudaHostAllocDefault);
+	cudaHostAlloc((void**)&c2, NO_LOOPS * MEMSIZE, cudaHostAllocDefault);
+
+	fillData(a2, NO_LOOPS * N);
+	fillData(b2, NO_LOOPS * N);
+
+	// Data chunks on GPU
+	cudaMalloc((void**)&da2, MEMSIZE);
+	cudaMalloc((void**)&db2, MEMSIZE);
+	cudaMalloc((void**)&dc2, MEMSIZE);
+
+	//TODO: create stream
+
+	cudaStream_t stream;
+	cudaStream_t stream2;
+	cudaStreamCreate(&stream);
+	cudaStreamCreate(&stream2);
+
+	auto lambda = [&]()
 		{
-			// Check Level 2: Indirect Red -> Barrier -> Green contact
-			// Barrier = Not Black, Not Red, Not Green
+			unsigned int dataOffset = 0;
+			unsigned int dataOffset2 = N * (NO_LOOPS- 1 );
+			for (int i = 0; i < NO_LOOPS / 2 ; i++)
+			{
+				cudaMemcpyAsync(da, &a[dataOffset], MEMSIZE, cudaMemcpyHostToDevice, stream);
+				cudaMemcpyAsync(db, &b[dataOffset], MEMSIZE, cudaMemcpyHostToDevice, stream);
+				kernel << <GRID_SIZE, TPB >> > (da, db, N, dc);
+				cudaMemcpyAsync(&c[dataOffset], dc, MEMSIZE, cudaMemcpyDeviceToHost, stream);
 
-			// Check N neighbor
-			if (!colorsMatch(nN, d_COLOR_BLACK) && !colorsMatch(nN, d_COLOR_RED) && !colorsMatch(nN, d_COLOR_GREEN)) {
-				if (colorsMatch(tex2D<DT>(srcTex, x, y + 2), d_COLOR_GREEN) ||
-					colorsMatch(tex2D<DT>(srcTex, x + 1, y + 2), d_COLOR_GREEN) ||
-					colorsMatch(tex2D<DT>(srcTex, x - 1, y + 2), d_COLOR_GREEN) ||
-					colorsMatch(tex2D<DT>(srcTex, x + 1, y + 1), d_COLOR_GREEN) ||
-					colorsMatch(tex2D<DT>(srcTex, x - 1, y + 1), d_COLOR_GREEN))
-				{
-					shouldStop = true;
-				}
+				cudaMemcpyAsync(da2, &a2[dataOffset2], MEMSIZE, cudaMemcpyHostToDevice, stream2);
+				cudaMemcpyAsync(db2, &b2[dataOffset2], MEMSIZE, cudaMemcpyHostToDevice, stream2);
+				kernel << <GRID_SIZE, TPB >> > (da2, db2, N, dc2);
+				cudaMemcpyAsync(&c[dataOffset2], dc, MEMSIZE, cudaMemcpyDeviceToHost, stream2);
+
+				dataOffset += N;
+				dataOffset2 -= N;
+				//TODO:  copy a->da, b->db
+				//TODO:  run the kernel in the stream
+				//TODO:  copy dc->c
+
 			}
-			// Check S neighbor
-			if (!shouldStop && !colorsMatch(nS, d_COLOR_BLACK) && !colorsMatch(nS, d_COLOR_RED) && !colorsMatch(nS, d_COLOR_GREEN)) {
-				if (colorsMatch(tex2D<DT>(srcTex, x, y - 2), d_COLOR_GREEN) ||
-					colorsMatch(tex2D<DT>(srcTex, x + 1, y - 2), d_COLOR_GREEN) ||
-					colorsMatch(tex2D<DT>(srcTex, x - 1, y - 2), d_COLOR_GREEN) ||
-					colorsMatch(tex2D<DT>(srcTex, x + 1, y - 1), d_COLOR_GREEN) ||
-					colorsMatch(tex2D<DT>(srcTex, x - 1, y - 1), d_COLOR_GREEN))
-				{
-					shouldStop = true;
-				}
+		};
+	float gpuTime = GPUTIME(NO_TEST_PHASES, lambda());
+
+	cudaStreamSynchronize(stream); // wait for stream to finish
+	cudaStreamDestroy(stream);
+	cudaStreamSynchronize(stream2); // wait for stream to finish
+	cudaStreamDestroy(stream2);
+	cudaDeviceSynchronize();
+	printf("\x1B[93m[GPU time] %s: %f ms\033[0m\n", __PRETTY_FUNCTION__, gpuTime);
+
+	//printData(c, 100);
+
+	cudaFree(da);
+	cudaFree(db);
+	cudaFree(dc);
+
+	cudaFreeHost(a);
+	cudaFreeHost(b);
+	cudaFreeHost(c);
+
+	cudaFree(da2);
+	cudaFree(db2);
+	cudaFree(dc2);
+
+	cudaFreeHost(a2);
+	cudaFreeHost(b2);
+	cudaFreeHost(c2);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+/// <summary>	Tests 3. - two streams - breadth first approach</summary>
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void test3()
+{
+	unsigned int* a, * b, * c;
+	unsigned int* da, * db, * dc;
+	unsigned int* a2, * b2, * c2;
+	unsigned int* da2, * db2, * dc2;
+	// paged-locked allocation
+	cudaHostAlloc((void**)&a, NO_LOOPS * MEMSIZE, cudaHostAllocDefault);
+	cudaHostAlloc((void**)&b, NO_LOOPS * MEMSIZE, cudaHostAllocDefault);
+	cudaHostAlloc((void**)&c, NO_LOOPS * MEMSIZE, cudaHostAllocDefault);
+
+	fillData(a, NO_LOOPS * N);
+	fillData(b, NO_LOOPS * N);
+
+	// Data chunks on GPU
+	cudaMalloc((void**)&da, MEMSIZE);
+	cudaMalloc((void**)&db, MEMSIZE);
+	cudaMalloc((void**)&dc, MEMSIZE);
+
+	cudaHostAlloc((void**)&a2, NO_LOOPS * MEMSIZE, cudaHostAllocDefault);
+	cudaHostAlloc((void**)&b2, NO_LOOPS * MEMSIZE, cudaHostAllocDefault);
+	cudaHostAlloc((void**)&c2, NO_LOOPS * MEMSIZE, cudaHostAllocDefault);
+
+	fillData(a2, NO_LOOPS * N);
+	fillData(b2, NO_LOOPS * N);
+
+	// Data chunks on GPU
+	cudaMalloc((void**)&da2, MEMSIZE);
+	cudaMalloc((void**)&db2, MEMSIZE);
+	cudaMalloc((void**)&dc2, MEMSIZE);
+
+	//TODO: create stream
+
+	cudaStream_t stream;
+	cudaStream_t stream2;
+	cudaStreamCreate(&stream);
+	cudaStreamCreate(&stream2);
+
+	auto lambda = [&]()
+		{
+			unsigned int dataOffset = 0;
+			unsigned int dataOffset2 = N * (NO_LOOPS - 1);
+			for (int i = 0; i < NO_LOOPS; i += 2)
+			{
+				cudaMemcpyAsync(da, &a[dataOffset], MEMSIZE, cudaMemcpyHostToDevice, stream);
+				cudaMemcpyAsync(da2, &a2[dataOffset2], MEMSIZE, cudaMemcpyHostToDevice, stream2);
+				cudaMemcpyAsync(db, &b[dataOffset], MEMSIZE, cudaMemcpyHostToDevice, stream);
+				cudaMemcpyAsync(db2, &b2[dataOffset2], MEMSIZE, cudaMemcpyHostToDevice, stream2);
+				kernel << <GRID_SIZE, TPB >> > (da, db, N, dc);
+				kernel << <GRID_SIZE, TPB >> > (da2, db2, N, dc2);
+				cudaMemcpyAsync(&c[dataOffset], dc, MEMSIZE, cudaMemcpyDeviceToHost, stream);
+				cudaMemcpyAsync(&c[dataOffset2], dc, MEMSIZE, cudaMemcpyDeviceToHost, stream2);
+				dataOffset += N;
+				dataOffset2 -= N;
+				//TODO:  copy a->da, b->db
+				//TODO:  run the kernel in the stream
+				//TODO:  copy dc->c
+
 			}
-			// Check E neighbor
-			if (!shouldStop && !colorsMatch(nE, d_COLOR_BLACK) && !colorsMatch(nE, d_COLOR_RED) && !colorsMatch(nE, d_COLOR_GREEN)) {
-				if (colorsMatch(tex2D<DT>(srcTex, x + 2, y), d_COLOR_GREEN) ||
-					colorsMatch(tex2D<DT>(srcTex, x + 2, y + 1), d_COLOR_GREEN) ||
-					colorsMatch(tex2D<DT>(srcTex, x + 2, y - 1), d_COLOR_GREEN) ||
-					colorsMatch(tex2D<DT>(srcTex, x + 1, y + 1), d_COLOR_GREEN) ||
-					colorsMatch(tex2D<DT>(srcTex, x + 1, y - 1), d_COLOR_GREEN))
-				{
-					shouldStop = true;
-				}
-			}
-			// Check W neighbor
-			if (!shouldStop && !colorsMatch(nW, d_COLOR_BLACK) && !colorsMatch(nW, d_COLOR_RED) && !colorsMatch(nW, d_COLOR_GREEN)) {
-				if (colorsMatch(tex2D<DT>(srcTex, x - 2, y), d_COLOR_GREEN) ||
-					colorsMatch(tex2D<DT>(srcTex, x - 2, y + 1), d_COLOR_GREEN) ||
-					colorsMatch(tex2D<DT>(srcTex, x - 2, y - 1), d_COLOR_GREEN) ||
-					colorsMatch(tex2D<DT>(srcTex, x - 1, y + 1), d_COLOR_GREEN) ||
-					colorsMatch(tex2D<DT>(srcTex, x - 1, y - 1), d_COLOR_GREEN))
-				{
-					shouldStop = true;
-				}
-			}
-			// Check NE neighbor
-			if (!shouldStop && !colorsMatch(nNE, d_COLOR_BLACK) && !colorsMatch(nNE, d_COLOR_RED) && !colorsMatch(nNE, d_COLOR_GREEN)) {
-				if (colorsMatch(tex2D<DT>(srcTex, x + 1, y + 2), d_COLOR_GREEN) ||
-					colorsMatch(tex2D<DT>(srcTex, x + 2, y + 1), d_COLOR_GREEN) ||
-					colorsMatch(tex2D<DT>(srcTex, x + 2, y + 2), d_COLOR_GREEN))
-				{
-					shouldStop = true;
-				}
-			}
-			// Check NW neighbor
-			if (!shouldStop && !colorsMatch(nNW, d_COLOR_BLACK) && !colorsMatch(nNW, d_COLOR_RED) && !colorsMatch(nNW, d_COLOR_GREEN)) {
-				if (colorsMatch(tex2D<DT>(srcTex, x - 1, y + 2), d_COLOR_GREEN) ||
-					colorsMatch(tex2D<DT>(srcTex, x - 2, y + 1), d_COLOR_GREEN) ||
-					colorsMatch(tex2D<DT>(srcTex, x - 2, y + 2), d_COLOR_GREEN))
-				{
-					shouldStop = true;
-				}
-			}
-			// Check SE neighbor
-			if (!shouldStop && !colorsMatch(nSE, d_COLOR_BLACK) && !colorsMatch(nSE, d_COLOR_RED) && !colorsMatch(nSE, d_COLOR_GREEN)) {
-				if (colorsMatch(tex2D<DT>(srcTex, x + 1, y - 2), d_COLOR_GREEN) ||
-					colorsMatch(tex2D<DT>(srcTex, x + 2, y - 1), d_COLOR_GREEN) ||
-					colorsMatch(tex2D<DT>(srcTex, x + 2, y - 2), d_COLOR_GREEN))
-				{
-					shouldStop = true;
-				}
-			}
-			// Check SW neighbor
-			if (!shouldStop && !colorsMatch(nSW, d_COLOR_BLACK) && !colorsMatch(nSW, d_COLOR_RED) && !colorsMatch(nSW, d_COLOR_GREEN)) {
-				if (colorsMatch(tex2D<DT>(srcTex, x - 1, y - 2), d_COLOR_GREEN) ||
-					colorsMatch(tex2D<DT>(srcTex, x - 2, y - 1), d_COLOR_GREEN) ||
-					colorsMatch(tex2D<DT>(srcTex, x - 2, y - 2), d_COLOR_GREEN))
-				{
-					shouldStop = true;
-				}
-			}
-		}
-
-		// If stop condition met by this thread, signal the global flag atomically
-		if (shouldStop) {
-			atomicMax(stopFlag, 1);
-		}
-	}
-
-	// Write the calculated next state color to the output PBO
-	unsigned int pboIndex = y * pboWidth + x;
-	pbo[pboIndex] = nextPixelState;
-}
-
-// Forward declaration for my_idle
-void my_idle();
-// Forward declaration for saving image
-void saveImageFromTexture(GLuint textureID, unsigned int width, unsigned int height, const char* filename);
-
-
-// Host function controlling CUDA work per frame
-void cudaWorker()
-{
-	if (!simulationRunning) return; // Stop if flag is set
-
-	// Map GL resources (TEXTURE and PBO) for CUDA access
-	checkCudaErrors(cudaGraphicsMapResources(1, &cd.texResource, 0));
-	checkCudaErrors(cudaGraphicsSubResourceGetMappedArray(&cd.texArrayData, cd.texResource, 0, 0));
-	unsigned char* pboData;
-	size_t pbo_size = 0;
-	checkCudaErrors(cudaGraphicsMapResources(1, &cd.pboResource, 0));
-	checkCudaErrors(cudaGraphicsResourceGetMappedPointer((void**)&pboData, &pbo_size, cd.pboResource));
-
-	// Reset the global stop flag on the GPU before the kernel runs
-	checkCudaErrors(cudaMemset(d_stopFlag, 0, sizeof(int)));
-
-	// Run kernel
-	dim3 block(TPB_1D, TPB_1D);
-	dim3 grid((gl.imageWidth + block.x - 1) / block.x, (gl.imageHeight + block.y - 1) / block.y);
-	diseaseSpreadKernel << <grid, block >> > (cd.texObj, gl.imageWidth, gl.imageHeight, (DT*)pboData, d_stopFlag);
-	checkCudaErrors(cudaGetLastError());
-	checkCudaErrors(cudaDeviceSynchronize()); // Wait for kernel to finish and flag to be potentially set
-
-	// Unmap GL Resources (release them back to OpenGL)
-	checkCudaErrors(cudaGraphicsUnmapResources(1, &cd.pboResource, 0));
-	checkCudaErrors(cudaGraphicsUnmapResources(1, &cd.texResource, 0));
-
-	// Update GL texture from PBO data computed by CUDA
-	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, gl.pboID);
-	glBindTexture(GL_TEXTURE_2D, gl.textureID);
-	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, gl.imageWidth, gl.imageHeight, GL_RGBA, GL_UNSIGNED_BYTE, NULL); // Data comes from PBO
-	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-	glBindTexture(GL_TEXTURE_2D, 0);
-
-	// Check the stop flag by copying it back from Device to Host
-	int h_stopFlag = 0;
-	checkCudaErrors(cudaMemcpy(&h_stopFlag, d_stopFlag, sizeof(int), cudaMemcpyDeviceToHost));
-
-	if (h_stopFlag == 1) {
-		printf("\nSimulation stop condition met! Halting simulation updates.\n");
-		simulationRunning = false;
-		glutIdleFunc(NULL); // Stop GLUT from calling the idle function
-
-		// Save the final state from the OpenGL texture
-		saveImageFromTexture(gl.textureID, gl.imageWidth, gl.imageHeight, "final_state.png");
-
-	}
-	else {
-		// Print progress indicator if still running
-		printf(".");
-		fflush(stdout);
-	}
-}
-
-// Initialize CUDA objects and OpenGL-CUDA interop
-void initCUDAObjects()
-{
-	// Register OpenGL Texture for CUDA access (read-only)
-	checkCudaErrors(cudaGraphicsGLRegisterImage(&cd.texResource, gl.textureID, GL_TEXTURE_2D, cudaGraphicsRegisterFlagsReadOnly));
-
-	// Map texture resource to get CUDA array
-	checkCudaErrors(cudaGraphicsMapResources(1, &cd.texResource, 0));
-	checkCudaErrors(cudaGraphicsSubResourceGetMappedArray(&cd.texArrayData, cd.texResource, 0, 0));
-
-	// Describe the CUDA resource as an array
-	cd.resDesc.resType = cudaResourceTypeArray;
-	cd.resDesc.res.array.array = cd.texArrayData;
-
-	// Describe how CUDA should sample the texture
-	cd.texDesc.addressMode[0] = cudaAddressModeClamp; // Clamp coordinates at edges
-	cd.texDesc.addressMode[1] = cudaAddressModeClamp;
-	cd.texDesc.filterMode = cudaFilterModePoint;      // No interpolation between pixels
-	cd.texDesc.readMode = cudaReadModeElementType;    // Read elements as their native type (uchar4)
-	cd.texDesc.normalizedCoords = false;              // Use integer pixel coordinates
-
-	// Get channel description from the CUDA array
-	checkCudaErrors(cudaGetChannelDesc(&cd.texChannelDesc, cd.texArrayData));
-
-	// Create the CUDA texture object for kernel access
-	checkCudaErrors(cudaCreateTextureObject(&cd.texObj, &cd.resDesc, &cd.texDesc, NULL));
-
-	// Unmap the texture resource (release it for OpenGL)
-	checkCudaErrors(cudaGraphicsUnmapResources(1, &cd.texResource, 0));
-
-	// Register OpenGL PBO for CUDA access (write-discard)
-	checkCudaErrors(cudaGraphicsGLRegisterBuffer(&cd.pboResource, gl.pboID, cudaGraphicsMapFlagsWriteDiscard));
-
-	// --- Constant Memory Initialization ---
-	uchar4 h_COLOR_BLACK = make_uchar4(0, 0, 0, 255);
-	uchar4 h_COLOR_WHITE = make_uchar4(255, 255, 255, 255);
-	uchar4 h_COLOR_GREEN = make_uchar4(0, 255, 0, 255);
-	uchar4 h_COLOR_RED = make_uchar4(255, 0, 0, 255);
-
-	checkCudaErrors(cudaMemcpyToSymbol(d_COLOR_BLACK, &h_COLOR_BLACK, sizeof(uchar4)));
-	checkCudaErrors(cudaMemcpyToSymbol(d_COLOR_WHITE, &h_COLOR_WHITE, sizeof(uchar4)));
-	checkCudaErrors(cudaMemcpyToSymbol(d_COLOR_GREEN, &h_COLOR_GREEN, sizeof(uchar4)));
-	checkCudaErrors(cudaMemcpyToSymbol(d_COLOR_RED, &h_COLOR_RED, sizeof(uchar4)));
-
-	// Allocate and initialize the global stop flag in device memory
-	checkCudaErrors(cudaMalloc((void**)&d_stopFlag, sizeof(int)));
-	checkCudaErrors(cudaMemset(d_stopFlag, 0, sizeof(int)));
-}
-
-// Release CUDA resources
-void releaseCUDA()
-{
-	if (cd.pboResource) cudaGraphicsUnregisterResource(cd.pboResource);
-	if (cd.texResource) cudaGraphicsUnregisterResource(cd.texResource);
-	if (cd.texObj) cudaDestroyTextureObject(cd.texObj); // Destroy texture object
-
-	if (d_stopFlag) cudaFree(d_stopFlag);
-	d_stopFlag = nullptr;
-
-	cudaDeviceReset();
-}
-#pragma endregion
-
-#pragma region OpenGL Routines
-
-// Load image, prepare GL Texture and PBO
-void prepareGlObjects(const char* imageFileName)
-{
-	printf("Loading image: %s\n", imageFileName);
-	FIBITMAP* tmp = ImageManager::GenericLoader(imageFileName, 0);
-	if (!tmp) {
-		fprintf(stderr, "ERROR: Could not load image %s\n", imageFileName);
-		exit(EXIT_FAILURE);
-	}
-
-	gl.imageWidth = FreeImage_GetWidth(tmp);
-	gl.imageHeight = FreeImage_GetHeight(tmp);
-	gl.imageBPP = FreeImage_GetBPP(tmp);
-	gl.imagePitch = FreeImage_GetPitch(tmp);
-
-	// Ensure image is 32-bit for RGBA consistency
-	if (gl.imageBPP != 32) {
-		printf("Converting image to 32bpp...\n");
-		FIBITMAP* temp = FreeImage_ConvertTo32Bits(tmp);
-		if (!temp) {
-			fprintf(stderr, "ERROR: FreeImage_ConvertTo32Bits failed!\n");
-			FreeImage_Unload(tmp);
-			exit(EXIT_FAILURE);
-		}
-		FreeImage_Unload(tmp);
-		tmp = temp;
-		gl.imageBPP = FreeImage_GetBPP(tmp);
-		gl.imagePitch = FreeImage_GetPitch(tmp);
-		if (gl.imageBPP != 32) { // Sanity check
-			fprintf(stderr, "ERROR: Image BPP is %u after conversion attempt!\n", gl.imageBPP);
-			FreeImage_Unload(tmp);
-			exit(EXIT_FAILURE);
-		}
-	}
-
-	// Determine source format for glTexImage2D based on masks
-	unsigned int red_mask = FreeImage_GetRedMask(tmp);
-	unsigned int green_mask = FreeImage_GetGreenMask(tmp);
-	unsigned int blue_mask = FreeImage_GetBlueMask(tmp);
-	GLenum sourceFormat = GL_BGRA; // Common default for 32bpp loaded by FreeImage on Windows
-	if (red_mask == 0x000000FF && green_mask == 0x0000FF00 && blue_mask == 0x00FF0000) {
-		printf("Detected RGBA byte order from FreeImage.\n");
-		sourceFormat = GL_RGBA;
-	}
-	else if (red_mask == 0x00FF0000 && green_mask == 0x0000FF00 && blue_mask == 0x000000FF) {
-		printf("Detected BGRA byte order from FreeImage.\n");
-		sourceFormat = GL_BGRA;
-	}
-	else {
-		printf("Warning: Unusual 32bpp color mask order. Assuming BGRA.\n");
-	}
-
-	// --- Create OpenGL Texture ---
-	glGenTextures(1, &gl.textureID);
-	glBindTexture(GL_TEXTURE_2D, gl.textureID);
-	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-	glPixelStorei(GL_UNPACK_ROW_LENGTH, gl.imagePitch / (gl.imageBPP / 8)); // Use pitch info
-
-	BYTE* pixelData = FreeImage_GetBits(tmp);
-	if (!pixelData) {
-		fprintf(stderr, "ERROR: FreeImage_GetBits returned NULL!\n");
-		FreeImage_Unload(tmp);
-		exit(EXIT_FAILURE);
-	}
-
-	// Upload image data to GPU Texture. Use GL_RGBA8 for internal format for consistency.
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, gl.imageWidth, gl.imageHeight, 0, sourceFormat, GL_UNSIGNED_BYTE, pixelData);
-	GLenum glError = glGetError();
-	if (glError != GL_NO_ERROR) {
-		fprintf(stderr, "OpenGL Error after glTexImage2D: 0x%x\n", glError);
-		FreeImage_Unload(tmp);
-		exit(EXIT_FAILURE);
-	}
-
-	glPixelStorei(GL_UNPACK_ROW_LENGTH, 0); // Reset row length
-
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-	FreeImage_Unload(tmp); // Free host bitmap memory
-
-	// --- Create OpenGL Pixel Buffer Object (PBO) ---
-	glGenBuffers(1, &gl.pboID);
-	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, gl.pboID);
-	glBufferData(GL_PIXEL_UNPACK_BUFFER, (size_t)gl.imageWidth * gl.imageHeight * 4, NULL, GL_DYNAMIC_DRAW); // Allocate PBO size
-	glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-
-	printf("OpenGL objects prepared.\n");
-}
-
-// Function to save the current content of an OpenGL Texture to a file using FreeImage
-void saveImageFromTexture(GLuint textureID, unsigned int width, unsigned int height, const char* filename)
-{
-	printf("Attempting to save final state to %s...\n", filename);
-
-	unsigned int bytesPerPixel = 4;
-	size_t bufferSize = (size_t)width * height * bytesPerPixel;
-	BYTE* h_imageData = new (std::nothrow) BYTE[bufferSize];
-	if (!h_imageData) {
-		fprintf(stderr, "ERROR: Failed to allocate host memory (%zu bytes) for saving image.\n", bufferSize);
-		return;
-	}
-
-	glBindTexture(GL_TEXTURE_2D, textureID);
-	GLenum glErr = glGetError();
-	if (glErr != GL_NO_ERROR) {
-		fprintf(stderr, "OpenGL Error (%#x) before glGetTexImage.\n", glErr);
-		delete[] h_imageData;
-		glBindTexture(GL_TEXTURE_2D, 0);
-		return;
-	}
-
-	// Read texture data asking for GL_BGRA (often native, avoids driver swap) and handles potential R/B swap on save.
-	printf("Reading texture data (glGetTexImage asking for BGRA)...\n");
-	glGetTexImage(GL_TEXTURE_2D, 0, GL_BGRA, GL_UNSIGNED_BYTE, h_imageData);
-	glErr = glGetError();
-	if (glErr != GL_NO_ERROR) {
-		fprintf(stderr, "OpenGL Error (%#x) during glGetTexImage.\n", glErr);
-		delete[] h_imageData;
-		glBindTexture(GL_TEXTURE_2D, 0);
-		return;
-	}
-
-	// Convert raw bits to FreeImage bitmap.
-	// Use masks corresponding to GL_BGRA byte order (on little-endian).
-	// Set topdown=FALSE because glGetTexImage reads bottom-up.
-	unsigned int pitch = width * bytesPerPixel;
-	unsigned int rmask = 0x00FF0000;
-	unsigned int gmask = 0x0000FF00;
-	unsigned int bmask = 0x000000FF;
-	printf("Converting raw bits to FreeImage bitmap (BGRA masks, bottom-up)...\n");
-	FIBITMAP* bitmap = FreeImage_ConvertFromRawBits(h_imageData, width, height, pitch, 32, rmask, gmask, bmask, FALSE);
-
-	if (!bitmap) {
-		fprintf(stderr, "ERROR: FreeImage_ConvertFromRawBits failed.\n");
-		delete[] h_imageData;
-		glBindTexture(GL_TEXTURE_2D, 0);
-		return;
-	}
-
-	// Save the bitmap
-	FREE_IMAGE_FORMAT format = FreeImage_GetFIFFromFilename(filename);
-	if (format == FIF_UNKNOWN) {
-		format = FIF_PNG; // Default to PNG
-	}
-	printf("Saving bitmap to %s (Format: %d)...\n", filename, format);
-	BOOL success = FreeImage_Save(format, bitmap, filename, 0);
-
-	if (!success) {
-		fprintf(stderr, "ERROR: FreeImage_Save failed for %s.\n", filename);
-	}
-	else {
-		printf("Image successfully saved to %s.\n", filename);
-	}
-
-	// Clean up
-	FreeImage_Unload(bitmap);
-	delete[] h_imageData;
-	glBindTexture(GL_TEXTURE_2D, 0);
-}
-
-// GLUT display callback
-void my_display()
-{
-	glClear(GL_COLOR_BUFFER_BIT); // No depth buffer needed for 2D
-
-	glEnable(GL_TEXTURE_2D);
-	glBindTexture(GL_TEXTURE_2D, gl.textureID);
-
-	// Simple quad covering the viewport
-	glBegin(GL_QUADS);
-	glTexCoord2d(0, 0); glVertex2d(0, 0);
-	glTexCoord2d(1, 0); glVertex2d(gl.viewportWidth, 0);
-	glTexCoord2d(1, 1); glVertex2d(gl.viewportWidth, gl.viewportHeight);
-	glTexCoord2d(0, 1); glVertex2d(0, gl.viewportHeight);
-	glEnd();
-
-	glDisable(GL_TEXTURE_2D);
-
-	glFlush();
-	glutSwapBuffers();
-}
-
-// GLUT resize callback
-void my_resize(GLsizei w, GLsizei h)
-{
-	gl.viewportWidth = w;
-	gl.viewportHeight = h;
-
-	glViewport(0, 0, gl.viewportWidth, gl.viewportHeight);
-
-	glMatrixMode(GL_PROJECTION);
-	glLoadIdentity();
-	gluOrtho2D(0, gl.viewportWidth, 0, gl.viewportHeight); // Simple 2D orthographic projection
-
-	glMatrixMode(GL_MODELVIEW);
-	glLoadIdentity();
-	glutPostRedisplay();
-}
-
-// GLUT idle callback (runs the simulation step)
-void my_idle()
-{
-	cudaWorker();
-	glutPostRedisplay(); // Request redraw after simulation step
-}
-
-// Initialize GLUT and OpenGL
-void initGL(int argc, char** argv)
-{
-	glutInit(&argc, argv);
-
-	glutInitDisplayMode(GLUT_RGBA | GLUT_DOUBLE); // Double buffered RGBA
-	glutInitWindowSize(gl.viewportWidth, gl.viewportHeight);
-	glutInitWindowPosition(0, 0);
-	// Request new context, safer for CUDA interop
-	glutSetOption(GLUT_RENDERING_CONTEXT, GLUT_CREATE_NEW_CONTEXT);
-	glutCreateWindow("CUDA Disease Spread");
-	glutSetOption(GLUT_ACTION_ON_WINDOW_CLOSE, GLUT_ACTION_GLUTMAINLOOP_RETURNS); // Allow clean exit
-
-	// Initialize GLEW *after* context creation
-	glewInit();
-	if (!glewIsSupported("GL_VERSION_2_0")) {
-		fprintf(stderr, "OpenGL 2.0 not available\n");
-		exit(EXIT_FAILURE);
-	}
-
-	glutDisplayFunc(my_display);
-	glutReshapeFunc(my_resize);
-	glutIdleFunc(my_idle); // Assign the idle function
-	glutSetCursor(GLUT_CURSOR_CROSSHAIR);
-
-	glClearColor(0.0, 0.0, 0.0, 1.0);
-	glDisable(GL_DEPTH_TEST); // Not needed for 2D texture display
-	glViewport(0, 0, gl.viewportWidth, gl.viewportHeight);
-
-	glFlush();
-}
-
-// Release OpenGL resources
-void releaseOpenGL()
-{
-	if (gl.textureID > 0) glDeleteTextures(1, &gl.textureID);
-	gl.textureID = 0;
-	if (gl.pboID > 0) glDeleteBuffers(1, &gl.pboID);
-	gl.pboID = 0;
-}
-#pragma endregion OpenGL Routines
-
-
-bool resourcesReleased = false;
-// Cleanup function registered with atexit
-void releaseResources()
-{
-	if (!resourcesReleased) {
-		printf("\nReleasing resources...\n");
-		releaseCUDA();      // Release CUDA first (interop)
-		releaseOpenGL();
-		FreeImage_DeInitialise(); // Deinitialize FreeImage library
-		printf("Resources released.\n");
-		resourcesReleased = true;
-	}
+		};
+	float gpuTime = GPUTIME(NO_TEST_PHASES, lambda());
+
+	cudaStreamSynchronize(stream); // wait for stream to finish
+	cudaStreamDestroy(stream);
+	cudaStreamSynchronize(stream2); // wait for stream to finish
+	cudaStreamDestroy(stream2);
+	cudaDeviceSynchronize();
+	printf("\x1B[93m[GPU time] %s: %f ms\033[0m\n", __PRETTY_FUNCTION__, gpuTime);
+
+	//printData(c, 100);
+
+	cudaFree(da);
+	cudaFree(db);
+	cudaFree(dc);
+
+	cudaFreeHost(a);
+	cudaFreeHost(b);
+	cudaFreeHost(c);
+
+	cudaFree(da2);
+	cudaFree(db2);
+	cudaFree(dc2);
+
+	cudaFreeHost(a2);
+	cudaFreeHost(b2);
+	cudaFreeHost(c2);
 }
 
 
-int main(int argc, char* argv[])
+int main(int argc, char *argv[])
 {
-	FreeImage_Initialise(); // Initialize FreeImage library
-	atexit(releaseResources); // Register cleanup function for exit
+	initializeCUDA(deviceProp);
 
-	// Select CUDA device
-	int dev = findCudaDevice(argc, (const char**)argv);
-	checkCudaErrors(cudaGetDeviceProperties(&deviceProp, dev));
-	printf("Using CUDA device %d: %s\n", dev, deviceProp.name);
+	test1();
+	test2();
+	test3();
 
-	initGL(argc, argv); // Initialize OpenGL and GLUT
-
-	// Prepare OpenGL Texture and PBO from input image
-	prepareGlObjects("C:\\Users\\BoushiPC\\Documents\\PythonScripts\\PA2\\src/map.png"); // Replace with your image path
-
-	initCUDAObjects(); // Initialize CUDA objects and GL/CUDA interop
-
-	printf("\nStarting simulation. Dots indicate simulation steps.\n");
-	glutMainLoop(); // Start GLUT event loop
-
-	printf("\nExiting application.\n");
-	return EXIT_SUCCESS; // releaseResources called by atexit
+	return 0;
 }
