@@ -1,0 +1,13 @@
+Ta prezentace toho projektu bude vypadat ve smyslu že máme appku a ho bude hlavně zajímat se nad tím zamyslet ve stylu jak to funguje, jak to realizujeme, jak by to případně fungovalo když by to vypadalo jinak?
+
+Představuju si že ho bude hlavně zajímat optimizační, pamětní stránka apod, jak to pararelizujeme.
+
+Chce za 14 dní už vidět nějaký kód, řekl že povinně, takže si myslím že k tomu sednu, sepíšu tasky co bude třeba udělat a postupně na tom začneme makat.
+
+Taky upozorňoval ať si dáme bacha na některé věci co jsou striktně Cčkové, třeba typedef struct idk xdd
+
+Říkal že je důležité si nastřelit nějakou věc, prostě to rozjet a potom se to dá zoptimalizovat
+
+Není třeba to být super optimalizované, potom se o tom můžeme bavit u prezentace ale nemusí to být 100% optimalizovane
+
+
